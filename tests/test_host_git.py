@@ -431,3 +431,75 @@ def test_endgame_delegates_to_safe_candidate_materialization() -> None:
     assert "validate_candidate.py" in shell and "git -C" not in shell
     assert "from factory_runtime.host_git import materialize_commit" in implementation
     assert "materialize_commit(" in implementation
+
+
+def _directory_linked(tmp_path: Path, links: dict[str, str]) -> tuple[Path, str]:
+    # Wander's monolith shares one skill folder through a link (CHAN-10219):
+    # .claude/skills/fix-and-extract -> ../../.agents/skills/fix-and-extract
+    repository, _ = committed_repository(
+        tmp_path, {".agents/skills/fix/SKILL.md": "skill\n", "notes/a.txt": "a\n"}
+    )
+    for name, target in links.items():
+        link = repository / name
+        link.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(target, link)
+    git(repository, "add", "-A")
+    git(repository, "commit", "-qm", "links")
+    return repository, git(repository, "rev-parse", "HEAD")
+
+
+def judge_with_directory_links(repository: Path, commit: str, destination: Path,
+                               **options: object) -> MaterializedCommit:
+    return materialize_commit(
+        repository, commit, destination, admit_symlinks=True, contained_file_links=True,
+        contained_directory_links=True, **CEILINGS, **options,  # type: ignore[arg-type]
+    )
+
+
+def test_a_contained_directory_link_is_written_as_committed(tmp_path: Path) -> None:
+    repository, commit = _directory_linked(
+        tmp_path, {".claude/skills/fix": "../../.agents/skills/fix"}
+    )
+    with pytest.raises(HostGitError, match="links to a tree directory"):
+        materialize_commit(repository, commit, tmp_path / "file-links-only",
+                           admit_symlinks=True, contained_file_links=True, **CEILINGS)
+    judged = tmp_path / "judged"
+    judge_with_directory_links(repository, commit, judged)
+    link = judged / ".claude/skills/fix"
+    assert os.readlink(link) == "../../.agents/skills/fix"
+    assert (link / "SKILL.md").read_text() == "skill\n"
+    assert link.resolve().is_relative_to(judged.resolve())
+
+
+@pytest.mark.parametrize(
+    ("target", "refusal"),
+    [
+        ("/etc", "unsafe file link target"),
+        ("../../../..", "escaping file link target"),
+        # Leaving the tree and coming back in is refused at the first step out.
+        ("../../../lane/.agents/skills/fix", "escaping file link target"),
+        # A link to a link is a chain, not a directory.
+        ("alias", "must link directly to a regular tree file"),
+        # Traversing through a link is refused before the target is reached.
+        ("alias/SKILL.md", "traverses a non-directory"),
+    ],
+)
+def test_unsafe_directory_links_are_still_refused(
+    tmp_path: Path, target: str, refusal: str
+) -> None:
+    repository, commit = _directory_linked(tmp_path, {
+        ".claude/skills/alias": "../../.agents/skills/fix",
+        ".claude/skills/probe": target,
+    })
+    with pytest.raises(HostGitError, match=refusal):
+        judge_with_directory_links(repository, commit, tmp_path / "judged")
+    assert not (tmp_path / "judged" / ".claude").exists()
+
+
+def test_directory_links_cannot_combine_with_a_partial_selection(tmp_path: Path) -> None:
+    repository, commit = _directory_linked(
+        tmp_path, {".claude/skills/fix": "../../.agents/skills/fix"}
+    )
+    with pytest.raises(HostGitError, match="over the whole tree"):
+        judge_with_directory_links(repository, commit, tmp_path / "judged",
+                                   select=lambda path: True)
